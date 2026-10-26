@@ -6,3 +6,402 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+// ---------------------------------------------------------------------------
+// Enums (values are PROPOSED in ERD v1.1 - confirm before migrating)
+// ---------------------------------------------------------------------------
+
+enum MembershipRole {
+  ADMIN
+  MEMBER
+}
+
+enum MembershipStatus {
+  ACTIVE
+  DEACTIVATED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum ContractReviewStatus {
+  PENDING_REVIEW
+  APPROVED
+}
+
+enum ProcessingStatus {
+  QUEUED
+  PROCESSING
+  SUCCEEDED
+  FAILED
+}
+
+enum ProcessingStage {
+  TEXT_EXTRACTION
+  OCR
+  AI_EXTRACTION
+  VALIDATION
+}
+
+enum ExtractionStatus {
+  PROPOSED
+  REVIEWED
+  SUPERSEDED
+}
+
+enum DraftSource {
+  AI_EXTRACTION
+  MANUAL_EDIT
+}
+
+enum DraftStatus {
+  OPEN
+  APPROVED
+  DISCARDED
+}
+
+enum CycleStatus {
+  ACTIVE
+  SUPERSEDED
+}
+
+enum TaskStatus {
+  OPEN
+  COMPLETED
+}
+
+// ---------------------------------------------------------------------------
+// Identity and Organizations
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  timezone  String // IANA name, e.g. "Asia/Hebron"; drives business dates
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  memberships             Membership[]
+  invitations             Invitation[]
+  auditLogs               AuditLog[]
+  contracts               Contract[]
+  documentAssets          DocumentAsset[]
+  processingAttempts      ProcessingAttempt[]
+  extractionResults       ExtractionResult[]
+  extractionEvidence      ExtractionEvidence[]
+  reviewDrafts            ContractReviewDraft[]
+  endDateRevisions        ContractEndDateRevision[]
+  renewalCycles           ContractRenewalCycle[]
+  tasks                   Task[]
+}
+
+model User {
+  id          String   @id @default(uuid()) @db.Uuid
+  clerkUserId String   @unique
+  email       String
+  displayName String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  memberships Membership[]
+}
+
+model Membership {
+  id             String           @id @default(uuid()) @db.Uuid
+  organizationId String           @db.Uuid
+  userId         String           @db.Uuid
+  role           MembershipRole
+  status         MembershipStatus
+  joinedAt       DateTime         @db.Timestamptz(3)
+  deactivatedAt  DateTime?        @db.Timestamptz(3)
+  createdAt      DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime         @updatedAt @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  invitationsSent           Invitation[]              @relation("InvitationInvitedBy")
+  auditLogsActed            AuditLog[]                @relation("AuditActor")
+  ownedContracts            Contract[]                @relation("ContractOwner")
+  uploadedDocuments         DocumentAsset[]           @relation("DocumentUploadedBy")
+  reviewedExtractionResults ExtractionResult[]        @relation("ExtractionReviewedBy")
+  createdDrafts             ContractReviewDraft[]     @relation("DraftCreatedBy")
+  reviewedDrafts            ContractReviewDraft[]     @relation("DraftReviewedBy")
+  approvedEndDateRevisions  ContractEndDateRevision[] @relation("RevisionApprovedBy")
+  assignedTasks             Task[]                    @relation("TaskAssignee")
+  completedTasks            Task[]                    @relation("TaskCompletedBy")
+
+  @@unique([organizationId, id]) // composite FK target (tenant integrity)
+  @@unique([organizationId, userId]) // one membership per user per org
+  @@index([userId])
+}
+
+model Invitation {
+  id                    String           @id @default(uuid()) @db.Uuid
+  organizationId        String           @db.Uuid
+  invitedByMembershipId String           @db.Uuid
+  email                 String
+  role                  MembershipRole
+  tokenHash             String           @unique
+  status                InvitationStatus
+  expiresAt             DateTime         @db.Timestamptz(3)
+  acceptedAt            DateTime?        @db.Timestamptz(3)
+  createdAt             DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime         @updatedAt @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  invitedBy    Membership   @relation("InvitationInvitedBy", fields: [organizationId, invitedByMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  // A "one PENDING invite per org+email" rule needs a partial unique index.
+  // Prisma cannot express it: add it as raw SQL in the migration (see plan).
+  @@index([organizationId, email])
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id                String   @id @default(uuid()) @db.Uuid
+  organizationId    String   @db.Uuid
+  actorMembershipId String?  @db.Uuid // NULL = system action
+  entityType        String
+  entityId          String   @db.Uuid
+  action            String
+  oldValues         Json?
+  newValues         Json?
+  metadata          Json?
+  createdAt         DateTime @default(now()) @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  actor        Membership?  @relation("AuditActor", fields: [organizationId, actorMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Contracts and Files
+// ---------------------------------------------------------------------------
+
+// Approved (live) values. Written only on approval, in one transaction, from the review draft.
+model Contract {
+  id                String               @id @default(uuid()) @db.Uuid
+  organizationId    String               @db.Uuid
+  ownerMembershipId String?              @db.Uuid
+  title             String
+  counterpartyName  String?
+  contractNumber    String?
+  startDate         DateTime?            @db.Date
+  endDate           DateTime?            @db.Date
+  contractValue     Decimal?             @db.Decimal(19, 4) // precision is my assumption: confirm
+  currency          String? // ISO 4217 code
+  renewalTerms      String?              @db.Text
+  reviewStatus      ContractReviewStatus // authoritative workflow state
+  archivedAt        DateTime?            @db.Timestamptz(3)
+  createdAt         DateTime             @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime             @updatedAt @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  owner        Membership?  @relation("ContractOwner", fields: [organizationId, ownerMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  documentAssets     DocumentAsset[]
+  extractionResults  ExtractionResult[]
+  reviewDrafts       ContractReviewDraft[]
+  endDateRevisions   ContractEndDateRevision[]
+  renewalCycles      ContractRenewalCycle[]
+  tasks              Task[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, archivedAt, reviewStatus])
+  @@index([organizationId, endDate])
+}
+
+model DocumentAsset {
+  id                     String           @id @default(uuid()) @db.Uuid
+  organizationId         String           @db.Uuid
+  contractId             String           @db.Uuid
+  uploadedByMembershipId String           @db.Uuid
+  storageKey             String           @unique
+  originalFilename       String
+  mimeType               String
+  fileSizeBytes          BigInt
+  checksum               String?
+  processingStatus       ProcessingStatus
+  updatedAt              DateTime         @updatedAt @db.Timestamptz(3)
+  processedAt            DateTime?        @db.Timestamptz(3)
+  uploadedAt             DateTime         @default(now()) @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  contract     Contract     @relation(fields: [organizationId, contractId], references: [organizationId, id], onDelete: Restrict)
+  uploadedBy   Membership   @relation("DocumentUploadedBy", fields: [organizationId, uploadedByMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  processingAttempts ProcessingAttempt[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, contractId])
+}
+
+// ---------------------------------------------------------------------------
+// AI Processing and Review
+// ---------------------------------------------------------------------------
+
+model ProcessingAttempt {
+  id              String           @id @default(uuid()) @db.Uuid
+  organizationId  String           @db.Uuid
+  documentAssetId String           @db.Uuid
+  attemptNumber   Int
+  status          ProcessingStatus
+  stage           ProcessingStage
+  provider        String?
+  model           String?
+  errorCode       String?
+  errorMessage    String?          @db.Text // safe, redacted message only
+  startedAt       DateTime         @db.Timestamptz(3)
+  finishedAt      DateTime?        @db.Timestamptz(3)
+
+  organization  Organization  @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  documentAsset DocumentAsset @relation(fields: [organizationId, documentAssetId], references: [organizationId, id], onDelete: Restrict)
+
+  extractionResults ExtractionResult[]
+
+  @@unique([organizationId, id])
+  @@unique([documentAssetId, attemptNumber])
+}
+
+model ExtractionResult {
+  id                     String           @id @default(uuid()) @db.Uuid
+  organizationId         String           @db.Uuid
+  processingAttemptId    String           @db.Uuid
+  contractId             String           @db.Uuid
+  status                 ExtractionStatus
+  sourceLanguage         String?
+  extractedPayload       Json // immutable raw AI output
+  validationErrors       Json?
+  reviewedByMembershipId String?          @db.Uuid
+  reviewedAt             DateTime?        @db.Timestamptz(3)
+  createdAt              DateTime         @default(now()) @db.Timestamptz(3)
+
+  organization      Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  processingAttempt ProcessingAttempt @relation(fields: [organizationId, processingAttemptId], references: [organizationId, id], onDelete: Restrict)
+  contract          Contract          @relation(fields: [organizationId, contractId], references: [organizationId, id], onDelete: Restrict)
+  reviewedBy        Membership?       @relation("ExtractionReviewedBy", fields: [organizationId, reviewedByMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  evidence     ExtractionEvidence[]
+  reviewDrafts ContractReviewDraft[]
+
+  @@unique([organizationId, id])
+  @@index([contractId, createdAt])
+}
+
+model ExtractionEvidence {
+  id                 String   @id @default(uuid()) @db.Uuid
+  organizationId     String   @db.Uuid
+  extractionResultId String   @db.Uuid
+  fieldName          String
+  evidenceText       String   @db.Text
+  pageNumber         Int? // "when available"
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
+
+  organization     Organization     @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  extractionResult ExtractionResult @relation(fields: [organizationId, extractionResultId], references: [organizationId, id], onDelete: Restrict)
+
+  @@index([extractionResultId, fieldName])
+}
+
+model ContractReviewDraft {
+  id                     String      @id @default(uuid()) @db.Uuid
+  organizationId         String      @db.Uuid
+  contractId             String      @db.Uuid
+  extractionResultId     String?     @db.Uuid
+  createdByMembershipId  String      @db.Uuid
+  source                 DraftSource
+  status                 DraftStatus // draft lifecycle only
+  proposedPayload        Json // editable working copy
+  validationErrors       Json?
+  reviewedByMembershipId String?     @db.Uuid
+  reviewedAt             DateTime?   @db.Timestamptz(3)
+  createdAt              DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime    @updatedAt @db.Timestamptz(3)
+
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  contract         Contract          @relation(fields: [organizationId, contractId], references: [organizationId, id], onDelete: Restrict)
+  extractionResult ExtractionResult? @relation(fields: [organizationId, extractionResultId], references: [organizationId, id], onDelete: Restrict)
+  createdBy        Membership        @relation("DraftCreatedBy", fields: [organizationId, createdByMembershipId], references: [organizationId, id], onDelete: Restrict)
+  reviewedBy       Membership?       @relation("DraftReviewedBy", fields: [organizationId, reviewedByMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  @@index([contractId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Deadlines and task cycles
+// ---------------------------------------------------------------------------
+
+model ContractEndDateRevision {
+  id                     String    @id @default(uuid()) @db.Uuid
+  organizationId         String    @db.Uuid
+  contractId             String    @db.Uuid
+  previousEndDate        DateTime? @db.Date
+  newEndDate             DateTime  @db.Date
+  reason                 String?   @db.Text
+  approvedByMembershipId String    @db.Uuid
+  approvedAt             DateTime  @db.Timestamptz(3)
+  createdAt              DateTime  @default(now()) @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  contract     Contract     @relation(fields: [organizationId, contractId], references: [organizationId, id], onDelete: Restrict)
+  approvedBy   Membership   @relation("RevisionApprovedBy", fields: [organizationId, approvedByMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  renewalCycles ContractRenewalCycle[]
+
+  @@unique([organizationId, id])
+  @@index([contractId, approvedAt])
+}
+
+model ContractRenewalCycle {
+  id                String      @id @default(uuid()) @db.Uuid
+  organizationId    String      @db.Uuid
+  contractId        String      @db.Uuid
+  endDateRevisionId String      @db.Uuid
+  approvedEndDate   DateTime    @db.Date
+  dueDate           DateTime    @db.Date // approvedEndDate minus 30 days, org timezone
+  cycleNumber       Int
+  status            CycleStatus
+  createdAt         DateTime    @default(now()) @db.Timestamptz(3)
+
+  organization    Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  contract        Contract                @relation(fields: [organizationId, contractId], references: [organizationId, id], onDelete: Restrict)
+  endDateRevision ContractEndDateRevision @relation(fields: [organizationId, endDateRevisionId], references: [organizationId, id], onDelete: Restrict)
+
+  tasks Task[]
+
+  @@unique([organizationId, id])
+  @@unique([contractId, cycleNumber])
+}
+
+// Title ("Review contract before expiration") and due date come from the cycle.
+model Task {
+  id                      String     @id @default(uuid()) @db.Uuid
+  organizationId          String     @db.Uuid
+  contractId              String     @db.Uuid
+  renewalCycleId          String     @unique @db.Uuid // one task per cycle in MVP
+  assigneeMembershipId    String?    @db.Uuid
+  status                  TaskStatus
+  completedAt             DateTime?  @db.Timestamptz(3)
+  completedByMembershipId String?    @db.Uuid
+  createdAt               DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt               DateTime   @updatedAt @db.Timestamptz(3)
+
+  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  contract     Contract             @relation(fields: [organizationId, contractId], references: [organizationId, id], onDelete: Restrict)
+  renewalCycle ContractRenewalCycle @relation(fields: [organizationId, renewalCycleId], references: [organizationId, id], onDelete: Restrict)
+  assignee     Membership?          @relation("TaskAssignee", fields: [organizationId, assigneeMembershipId], references: [organizationId, id], onDelete: Restrict)
+  completedBy  Membership?          @relation("TaskCompletedBy", fields: [organizationId, completedByMembershipId], references: [organizationId, id], onDelete: Restrict)
+
+  @@index([organizationId, status, assigneeMembershipId])
+}
